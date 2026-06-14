@@ -59,6 +59,7 @@ from bika.lims.interfaces import IClient
 from bika.lims.interfaces import ISubmitted
 from bika.lims.utils import getUsers
 from bika.lims.utils import tmpID
+from bika.lims.utils.analysisrequest import apply_custom_units
 from bika.lims.utils.analysisrequest import apply_hidden_services
 from bika.lims.workflow import getTransitionDate
 from bika.lims.workflow import getTransitionUsers
@@ -166,14 +167,19 @@ schema = BikaSchema.copy() + Schema((
             ui_item="Title",
             catalog=CONTACT_CATALOG,
             # Base query - gets overridden with client-specific query at
-            #  runtime to include both client contacts and global contacts
+            # runtime to include both client contacts and global contacts
             query={
-                "getParentUID": "",
                 "is_active": True,
                 "sort_on": "sortable_title",
                 "sort_order": "ascending"
             },
             columns=[
+                {
+                    "name": "scope",
+                    "width": "10",
+                    "align": "center",
+                    "label": "",
+                },
                 {"name": "Title", "label": _("Name")},
                 {"name": "getEmailAddress", "label": _("Email")},
             ],
@@ -204,12 +210,17 @@ schema = BikaSchema.copy() + Schema((
             # Base query - gets overridden with client-specific query at
             # runtime to include both client contacts and global contacts
             query={
-                "getParentUID": "",
                 "is_active": True,
                 "sort_on": "sortable_title",
                 "sort_order": "ascending"
             },
             columns=[
+                {
+                    "name": "scope",
+                    "width": "10",
+                    "align": "center",
+                    "label": "",
+                },
                 {"name": "Title", "label": _("Name")},
                 {"name": "getEmailAddress", "label": _("Email")},
             ],
@@ -1256,10 +1267,40 @@ schema = BikaSchema.copy() + Schema((
         )
     ),
 
+    # The source Sample this Sample was duplicated from via the
+    # 'duplicate_sample' workflow transition.
+    UIDReferenceField(
+        "DuplicatedFrom",
+        allowed_types=("AnalysisRequest",),
+        relationship="AnalysisRequestDuplicatedFrom",
+        mode="rw",
+        read_permission=View,
+        write_permission=ModifyPortalContent,
+        widget=ReferenceWidget(
+            label=_(
+                "label_sample_duplicated_from",
+                default="Duplicated from sample"),
+            description=_(
+                "description_sample_duplicated_from",
+                default="Reference to the source sample this sample "
+                        "was duplicated from"),
+            render_own_label=True,
+            readonly=True,
+            visible=False,
+            catalog_name=SAMPLE_CATALOG,
+            query={
+                "is_active": True,
+                "sort_on": "sortable_title",
+                "sort_order": "ascending"
+            },
+        )
+    ),
+
     # The Primary Sample the current sample was detached from
     UIDReferenceField(
         "DetachedFrom",
         allowed_types=("AnalysisRequest",),
+        relationship="AnalysisRequestDetachedFrom",
         mode="rw",
         read_permission=View,
         write_permission=ModifyPortalContent,
@@ -1563,6 +1604,9 @@ class AnalysisRequest(BaseFolder, ClientAwareMixin):
 
         # apply hidden services *after* the profiles have been set
         apply_hidden_services(self)
+
+        # apply custom units *after* the profiles have been set
+        apply_custom_units(self)
 
     def getClient(self):
         """Returns the client this object is bound to. We override getClient
@@ -2091,6 +2135,18 @@ class AnalysisRequest(BaseFolder, ClientAwareMixin):
         if sample_type:
             return sample_type.getHazardous()
         return False
+
+    @security.public
+    def getHazardCategories(self):
+        """Get the hazard categories inherited from the SampleType
+
+        :returns: Hazard category codes (GHS + ISO 7010)
+        :rtype: list
+        """
+        sample_type = self.getSampleType()
+        if sample_type:
+            return list(sample_type.getHazardCategories() or [])
+        return []
 
     @security.public
     def getSamplingWorkflowEnabled(self):

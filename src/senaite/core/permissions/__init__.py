@@ -74,7 +74,6 @@ from .worksheet.permissions import AddWorksheet
 from .worksheet.permissions import AddWorksheetTemplate
 from .worksheet.permissions import EditWorksheet
 from .worksheet.permissions import ManageWorksheets
-from .worksheet.permissions import TransitionRejectWorksheet
 from .worksheet.permissions import TransitionRemoveWorksheet
 from .worksheet.permissions import WorksheetAddAttachment
 # Analysis permissions
@@ -185,5 +184,7 @@ ViewResults = "senaite.core: View Results"
 # =======================
 # TODO Security Review these "view/action" permissions
 ImportInstrumentResults = "senaite.core: Import Instrument Results"
+ViewDashboard = "senaite.core: View Dashboard"
+ViewNavigation = "senaite.core: View Navigation"
 ViewRetractedAnalyses = "senaite.core: View Retracted Analyses"
 ViewLogTab = "senaite.core: View Log Tab"

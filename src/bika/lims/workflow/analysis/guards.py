@@ -24,9 +24,9 @@ from bika.lims import workflow as wf
 from bika.lims.api import security
 from bika.lims.interfaces import ISubmitted
 from bika.lims.interfaces import IVerified
-from bika.lims.interfaces import IWorksheet
 from bika.lims.interfaces.analysis import IRequestAnalysis
 from plone.memoize.request import cache
+from senaite.core.interfaces import IWorksheet
 
 
 def is_worksheet_context():
@@ -117,7 +117,7 @@ def guard_submit(analysis):
         if interim.get("allow_empty", False) in true_values:
             continue
 
-        if not interim.get("value", ""):
+        if interim.get("value") in [None, ""]:
             return False
 
     # Cannot submit if attachment not set, but is required

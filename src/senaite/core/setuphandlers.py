@@ -217,6 +217,7 @@ def add_senaite_setup(portal):
     """
     items = [
         # ID, Title, FTI
+        ("worksheets", "Worksheets", "Worksheets"),
         ("setup", "SENAITE Setup", "Setup"),
     ]
     add_dexterity_items(portal, items)
@@ -261,6 +262,8 @@ def add_senaite_setup_items(portal):
         ("suppliers", "Suppliers", "Suppliers"),
         ("sampletypes", "Sample Types", "SampleTypes"),
         ("worksheettemplates", "Worksheet Templates", "WorksheetTemplates"),
+        ("laboratory", "Laboratory", "Laboratory"),
+        ("calculations", "Calculations", "Calculations"),
     ]
     setup = api.get_senaite_setup()
     add_dexterity_items(setup, items)

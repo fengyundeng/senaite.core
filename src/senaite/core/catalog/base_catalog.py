@@ -27,14 +27,18 @@ from AccessControl.Permissions import \
 from Acquisition import aq_inner
 from Acquisition import aq_parent
 from App.class_init import InitializeClass
-from bika.lims import api
-from bika.lims import logger
 from Products.CMFPlone.CatalogTool import CatalogTool
 from Products.CMFPlone.utils import base_hasattr
 from Products.CMFPlone.utils import safe_callable
 from Products.ZCatalog.ZCatalog import ZCatalog
+from senaite.core import logger
 from senaite.core.interfaces import ISenaiteCatalogObject
 from zope.interface import implementer
+
+# NOTE: `bika.lims` is imported lazily inside functions to avoid a
+# circular import: `senaite.core.catalog.__init__` pulls in this module
+# via `analysis_catalog`, and `bika/lims/__init__.py` re-enters
+# `senaite.core.catalog` through `bika.lims.catalog`.
 
 CATALOG_ID = "senaite_catalog_base"
 CATALOG_TITLE = "Senaite Base Catalog"
@@ -93,6 +97,28 @@ class BaseCatalog(CatalogTool):
     def mapped_catalog_types(self):
         return TYPES
 
+    def _listAllowedRolesAndUsers(self, user):
+        """Extend the base allowed-roles list with the asking user's
+        linked client token.
+
+        Client-tree content carries a stable ``client:<client_uid>``
+        token in its ``allowedRolesAndUsers`` index (see
+        ``senaite.core.catalog.indexer.allowedrolesandusers``). For
+        every catalog query we look up the user's
+        ``linked_client_uid`` member property (set when a client
+        contact is linked to the user) and inject the matching
+        ``client:<uid>`` token, so client users see their client's
+        content without any persistent local role or group.
+        """
+        result = super(BaseCatalog, self)._listAllowedRolesAndUsers(user)
+        try:
+            client_uid = user.getProperty("linked_client_uid", "") or ""
+        except Exception:
+            client_uid = ""
+        if client_uid:
+            result.append("client:" + client_uid)
+        return result
+
     def supports_indexing(self, obj):
         """Checks if the object can be indexed
         """
@@ -105,6 +131,7 @@ class BaseCatalog(CatalogTool):
     def is_obj_indexable(self, obj, portal_type, mapped_types):
         """Checks if the object can be indexed
         """
+        from bika.lims import api
         if portal_type in mapped_types:
             return True
         if api.is_dexterity_content(obj):
@@ -115,6 +142,7 @@ class BaseCatalog(CatalogTool):
     def get_portal_type(self, obj):
         """Returns the portal type of the object
         """
+        from bika.lims import api
         if not api.is_object(obj):
             return None
         return api.get_portal_type(obj)
@@ -122,6 +150,7 @@ class BaseCatalog(CatalogTool):
     def get_mapped_at_types(self):
         """Returns all mapped AT types from archetype_tool
         """
+        from bika.lims import api
         at = api.get_tool("archetype_tool", default=None)
         if at is None:
             return []

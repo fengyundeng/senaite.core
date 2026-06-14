@@ -39,23 +39,8 @@ class IClientRegistry(ISenaiteRegistry):
         label=_(u"Client Settings"),
         description=_("Settings for Clients"),
         fields=[
-            "auto_create_client_group",
             "client_landing_page",
         ],
-    )
-
-    auto_create_client_group = schema.Bool(
-        title=_("Automatically Create Client Group"),
-        description=_("Automatically create a new global client group when a "
-                      "new client is created. If this is disabled, a client "
-                      "group is still created when a client contact is linked "
-                      "to a user account. Therefore, disabling this option "
-                      "makes only sense if you do not plan to link client "
-                      "contacts to user accounts and you want to keep your "
-                      "groups clean."
-                      ),
-        default=True,
-        required=False,
     )
 
     client_landing_page = schema.Choice(
@@ -106,37 +91,18 @@ class IWorksheetViewRegistry(ISenaiteRegistry):
     """View settings for worksheets
     """
     model.fieldset(
-        "worksheet_view",
-        label=_(u"Worksheet View"),
-        description=_("Worksheet view configuration"),
+        "worksheet_settings",
+        label=_(
+            u"label_registry_worksheet_settings",
+            default=u"Worksheet"
+        ),
+        description=_(
+            u"description_registry_worksheet_settings",
+            default=u"Worksheet view configuration"
+        ),
         fields=[
-            "worksheetview_analysis_columns_order",
             "worksheet_print_templates_order",
         ],
-    )
-
-    worksheetview_analysis_columns_order = schema.List(
-        title=_(u"Analysis columns order"),
-        description=_(
-            u"Default column order for worksheet analysis listings"
-        ),
-        value_type=schema.ASCIILine(title=u"Column"),
-        required=False,
-        default=[
-            "Pos",
-            "Service",
-            "AdditionalValues",
-            "DetectionLimitOperand",
-            "Result",
-            "Uncertainty",
-            "Specification",
-            "retested",
-            "Method",
-            "Instrument",
-            "Attachments",
-            "DueDate",
-            "state_title",
-        ]
     )
 
     worksheet_print_templates_order = schema.List(
@@ -161,7 +127,6 @@ class ISampleViewRegistry(ISenaiteRegistry):
             "sampleview_collapse_field_analysis_table",
             "sampleview_collapse_lab_analysis_table",
             "sampleview_collapse_qc_analysis_table",
-            "sampleview_analysis_columns_order",
         ],
     )
     sampleview_collapse_field_analysis_table = schema.Bool(
@@ -183,36 +148,6 @@ class ISampleViewRegistry(ISenaiteRegistry):
         description=_("Collapse qc analysis table in sample view"),
         default=True,
         required=False,
-    )
-
-    sampleview_analysis_columns_order = schema.List(
-        title=_(u"Analysis columns order"),
-        description=_(
-            u"Default column order for sample analysis listings"
-        ),
-        value_type=schema.ASCIILine(title=u"Column"),
-        required=False,
-        default=[
-            "created",
-            "Service",
-            "AdditionalValues",
-            "DetectionLimitOperand",
-            "Result",
-            "Uncertainty",
-            "Unit",
-            "Specification",
-            "retested",
-            "Method",
-            "Instrument",
-            "Calculation",
-            "Attachments",
-            "SubmittedBy",
-            "Analyst",
-            "CaptureDate",
-            "DueDate",
-            "state_title",
-            "Hidden",
-        ]
     )
 
 
@@ -380,6 +315,7 @@ class ISampleRegistry(ISenaiteRegistry):
             "sample_add_form_skip_partition_analyses",
             "sample_add_form_skip_analyses_in_states",
             "sample_add_form_allow_multi_paste",
+            "sample_add_form_commit_per_sample",
             "trigger_events_on_sample_creation",
         ],
     )
@@ -444,6 +380,25 @@ class ISampleRegistry(ISenaiteRegistry):
                     u"the fields listed here."
         ),
         value_type=schema.ASCIILine(),
+        required=False,
+    )
+
+    sample_add_form_commit_per_sample = schema.Bool(
+        title=_(
+            u"label_registry_sample_add_commit_per_sample",
+            default=u"Commit each sample in its own transaction"
+        ),
+        description=_(
+            u"description_registry_sample_add_commit_per_sample",
+            default=u"When enabled, each sample created from the add form "
+                    u"is committed in its own ZODB transaction with a "
+                    u"per-sample retry on conflict. This reduces the chance "
+                    u"that ID-counter or container contention aborts the "
+                    u"whole batch on instances with many concurrent users. "
+                    u"When disabled, the whole batch is created in a single "
+                    u"transaction (legacy behaviour)."
+        ),
+        default=False,
         required=False,
     )
 

@@ -18,14 +18,63 @@
 # Copyright 2018-2025 by it's authors.
 # Some rights reserved, see README and LICENSE.
 
+from collections import OrderedDict
+
 from bika.lims import _
 from bika.lims import api
 from senaite.core.api import geo
 from senaite.core.config.setup import SKIP_NAV_TYPES
+from senaite.core.interfaces import IWorksheetLayouts
+from zope.component import getUtilitiesFor
 from zope.i18n.locales import locales
 from zope.interface import implementer
 from zope.schema.interfaces import IVocabularyFactory
 from zope.schema.vocabulary import SimpleVocabulary
+
+
+ANALYSIS_COLUMNS = OrderedDict([
+    ("created", u"Date Created"),
+    ("Service", u"Analysis"),
+    ("AdditionalValues", u"Additional Values"),
+    ("DetectionLimitOperand", u"DL"),
+    ("Result", u"Result"),
+    ("Uncertainty", u"+-"),
+    ("Unit", u"Unit"),
+    ("Specification", u"Specification"),
+    ("retested", u"Retested"),
+    ("Method", u"Method"),
+    ("Instrument", u"Instrument"),
+    ("Calculation", u"Calculation"),
+    ("Attachments", u"Attachments"),
+    ("SubmittedBy", u"Submitter"),
+    ("Analyst", u"Analyst"),
+    ("ResultCaptureDate", u"Captured"),
+    ("DueDate", u"Due Date"),
+    ("state_title", u"Status"),
+    ("Hidden", u"Hidden"),
+])
+
+WORKSHEET_ANALYSIS_COLUMNS = OrderedDict([
+    ("Pos", u"Position"),
+    ("Service", u"Analysis"),
+    ("AdditionalValues", u"Additional Values"),
+    ("DetectionLimitOperand", u"DL"),
+    ("Result", u"Result"),
+    ("Uncertainty", u"+-"),
+    ("Unit", u"Unit"),
+    ("Specification", u"Specification"),
+    ("retested", u"Retested"),
+    ("Method", u"Method"),
+    ("Instrument", u"Instrument"),
+    ("Calculation", u"Calculation"),
+    ("Attachments", u"Attachments"),
+    ("SubmittedBy", u"Submitter"),
+    ("Analyst", u"Analyst"),
+    ("ResultCaptureDate", u"Captured"),
+    ("DueDate", u"Due Date"),
+    ("state_title", u"Status"),
+    ("Hidden", u"Hidden"),
+])
 
 
 @implementer(IVocabularyFactory)
@@ -88,13 +137,13 @@ class WorksheetLayoutVocabulary(object):
     """Vocabulary of worksheet layout options
     """
 
-    def __call__(self, context):
-        items = [
-            ("analyses_classic_view", "analyses_classic_view", _(u"Classic")),
-            ("analyses_transposed_view", "analyses_transposed_view",
-             _(u"Transposed")),
-        ]
-        return SimpleVocabulary.fromItems(items)
+    def __call__(self, context=None):
+        layouts = []
+        for name, utility in getUtilitiesFor(IWorksheetLayouts):
+            items = utility.getResultLayouts()
+            [layouts.append((key, key, title)) for key, title in items]
+
+        return SimpleVocabulary.fromItems(layouts)
 
 
 @implementer(IVocabularyFactory)
@@ -192,6 +241,33 @@ class NavigationPortalTypesVocabulary(object):
         return SimpleVocabulary.fromItems(items)
 
 
+@implementer(IVocabularyFactory)
+class AnalysisColumnsVocabulary(object):
+    """Vocabulary of analysis column keys with titles
+    """
+
+    def __call__(self, context):
+        items = [
+            (key, key, title)
+            for key, title in ANALYSIS_COLUMNS.items()
+        ]
+        return SimpleVocabulary.fromItems(items)
+
+
+@implementer(IVocabularyFactory)
+class WorksheetAnalysisColumnsVocabulary(object):
+    """Vocabulary of worksheet analysis column keys
+    """
+
+    def __call__(self, context):
+        items = [
+            (key, key, title)
+            for key, title
+            in WORKSHEET_ANALYSIS_COLUMNS.items()
+        ]
+        return SimpleVocabulary.fromItems(items)
+
+
 # Factory instances
 CurrenciesVocabularyFactory = CurrenciesVocabulary()
 CountriesVocabularyFactory = CountriesVocabulary()
@@ -203,3 +279,7 @@ MultiVerificationTypeVocabularyFactory = MultiVerificationTypeVocabulary()
 NumberOfVerificationsVocabularyFactory = NumberOfVerificationsVocabulary()
 TopLevelFoldersVocabularyFactory = TopLevelFoldersVocabulary()
 NavigationPortalTypesVocabularyFactory = NavigationPortalTypesVocabulary()
+AnalysisColumnsVocabularyFactory = AnalysisColumnsVocabulary()
+WorksheetAnalysisColumnsVocabularyFactory = (
+    WorksheetAnalysisColumnsVocabulary()
+)

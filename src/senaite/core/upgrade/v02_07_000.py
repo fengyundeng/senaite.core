@@ -19,30 +19,46 @@
 # Some rights reserved, see README and LICENSE.
 
 
+import json
 from datetime import timedelta
 
+import transaction
 from bika.lims import api
 from bika.lims.api import safe_unicode as u
+from bika.lims.api import snapshot as snap_api
+from bika.lims.browser.fields.uidreferencefield import get_backreferences
+from bika.lims.interfaces import IAuditable
+from bika.lims.interfaces import IDetachedPartition
 from bika.lims.interfaces import IInvalidated
 from bika.lims.utils import tmpID
+from persistent.list import PersistentList
 from plone.app.blob.field import BlobWrapper
-from plone.dexterity.fti import DexterityFTI
 from plone.dexterity.utils import createContent
 from plone.namedfile.file import NamedBlobFile
+from plone.namedfile.interfaces import INamed
+from Products.CMFEditions.interfaces import IVersioned
 from senaite.core import logger
 from senaite.core.api import dtime
+from senaite.core.api.catalog import add_column
+from senaite.core.api.catalog import del_column
+from senaite.core.api.catalog import del_index
+from senaite.core.api.catalog import reindex_index
 from senaite.core.catalog import ANALYSIS_CATALOG
 from senaite.core.catalog import CONTACT_CATALOG
 from senaite.core.catalog import REPORT_CATALOG
 from senaite.core.catalog import SAMPLE_CATALOG
 from senaite.core.catalog import SETUP_CATALOG
+from senaite.core.catalog import WORKSHEET_CATALOG
 from senaite.core.catalog.analysis_catalog import INDEXES as ANALYSIS_INDEXES
+from senaite.core.catalog.client_catalog import CATALOG_ID as CLIENT_CATALOG
 from senaite.core.config import PROJECTNAME as product
 from senaite.core.interfaces import IContentMigrator
 from senaite.core.interfaces.catalog import ISenaiteCatalogObject
+from senaite.core.schema.addressfield import BILLING_ADDRESS
 from senaite.core.schema.addressfield import NAIVE_ADDRESS
 from senaite.core.schema.addressfield import PHYSICAL_ADDRESS
 from senaite.core.schema.addressfield import POSTAL_ADDRESS
+from senaite.core.schema.uidreferencefield import get_backref_storage
 from senaite.core.setuphandlers import _run_import_step
 from senaite.core.setuphandlers import add_catalog_column
 from senaite.core.setuphandlers import add_catalog_index
@@ -50,9 +66,19 @@ from senaite.core.setuphandlers import add_dexterity_items
 from senaite.core.setuphandlers import setup_core_catalogs
 from senaite.core.upgrade import upgradestep
 from senaite.core.upgrade.utils import UpgradeUtils
+from senaite.core.upgrade.utils import blob_to_named_file
+from senaite.core.upgrade.utils import copy_snapshots
+from senaite.core.upgrade.utils import delete_object
+from senaite.core.upgrade.utils import iter_senaite_catalogs
 from senaite.core.upgrade.utils import permanently_allow_type_for
+from senaite.core.upgrade.utils import rebuild_index
+from senaite.core.upgrade.utils import remove_at_portal_types
+from senaite.core.upgrade.utils import uncatalog_object
+from senaite.core.upgrade.v02_06_000 import get_setup_folder
+from zope.annotation.interfaces import IAnnotations
 from zope.component import getMultiAdapter
 from zope.interface import alsoProvides
+from zope.interface import noLongerProvides
 
 version = "2.7.0"  # Remember version number in metadata.xml and setup.py
 profile = "profile-{0}:default".format(product)
@@ -60,8 +86,18 @@ profile = "profile-{0}:default".format(product)
 REMOVE_AT_TYPES = [
     "ARReport",
     "Contact",
+    "Laboratory",
+    "Calculation",
+    "Calculations",
     "Multifile",
+    "Worksheet",
+    "WorksheetFolder",
 ]
+
+PORTAL_FOLDER_ITEMS = {
+    # ID: ID, Title, FTI
+    "worksheets": ("worksheets", "Worksheets", "Worksheets"),
+}
 
 
 @upgradestep(product, version)
@@ -83,6 +119,147 @@ def upgrade(tool):
     return True
 
 
+def drop_client_ordering_annotations(tool):
+    """Remove the legacy IOrdering annotations from every Client.
+
+    Clients now use `plone.folder.unordered.UnorderedOrdering` as
+    their `IOrdering` adapter, so the previous default-ordering
+    annotations are no longer maintained:
+
+      - `plone.folder.ordered.order` — a `PersistentList` of every
+        child id, mutated on every `_setObject` via
+        `DefaultOrdering.notifyAdded`. On a Client with thousands of
+        children this list grows to many tens of thousands of entries
+        and, because `PersistentList` has no `_p_resolveConflict()`,
+        every concurrent registration on the same Client collided on
+        it and the conflict propagated all the way to the
+        publisher's retry loop.
+
+      - `plone.folder.ordered.pos` — companion `OIBTree` mapping
+        child id -> position. No longer read by anything once the
+        adapter is unordered.
+
+    Removing both annotations after the adapter switch frees the
+    storage they occupy and removes a stale hot-mutation bucket from
+    the ZODB cache. The adapter override is what stops new writes
+    from touching them; this step is hygiene.
+    """
+    ORDER_KEY = "plone.folder.ordered.order"
+    POS_KEY = "plone.folder.ordered.pos"
+
+    query = {"portal_type": "Client"}
+    brains = api.search(query, CLIENT_CATALOG)
+    total = len(brains)
+    logger.info(
+        "Dropping IOrdering annotations from {} clients".format(total))
+
+    cleaned = 0
+    for num, brain in enumerate(brains, start=1):
+        client = api.get_object(brain)
+        ann = IAnnotations(client)
+        had_order = ORDER_KEY in ann
+        had_pos = POS_KEY in ann
+        if not (had_order or had_pos):
+            continue
+        ann.pop(ORDER_KEY, None)
+        ann.pop(POS_KEY, None)
+        client._p_changed = True
+        cleaned += 1
+        if num % 100 == 0:
+            logger.info(
+                "  ... processed {}/{} clients ({} cleaned)".format(
+                    num, total, cleaned))
+            transaction.savepoint()
+
+    logger.info(
+        "Dropped IOrdering annotations from {}/{} clients".format(
+            cleaned, total))
+
+
+@upgradestep(product, version)
+def add_hazard_categories(tool):
+    """Register the hazard categories field and metadata column.
+
+    The new ``hazard_categories`` field on ``SampleType`` (DX)
+    and the ``HazardCategories`` field on ``ReferenceDefinition``
+    and ``ReferenceSample`` (AT) are picked up automatically by
+    the schema machinery. Existing objects default to an empty
+    list. The legacy ``Hazardous`` boolean is left untouched.
+    Samples (``AnalysisRequest``) inherit their effective
+    categories from the SampleType — no per-sample field.
+
+    The vocabulary covers the 9 GHS pictograms plus 10 ISO 7010
+    pictograms (biohazard, radioactive, non-ionising radiation,
+    electricity, low temperature, hot content, magnetic field,
+    hot surface, asphyxiating atmosphere, hot steam) for hazards
+    that GHS does not address.
+
+    Hazard pictograms are rendered in listings by reading the
+    ``getHazardous`` and ``getHazardCategories`` metadata columns
+    from the SampleType brain in the setup catalog (looked up by
+    UID via the ``getSampleTypeUID`` FieldIndex on the sample
+    catalog, already registered by the catalog setup step). This
+    avoids touching every sample on each SampleType edit. The
+    legacy ``getHazardous`` metadata column on the sample catalog
+    is removed since the flag is now resolved exclusively via the
+    SampleType brain.
+    """
+    logger.info("Adding hazard categories ...")
+    sample_catalog = api.get_tool(SAMPLE_CATALOG)
+    del_column(sample_catalog, "getHazardous")
+    setup_catalog = api.get_tool(SETUP_CATALOG)
+    add_column(setup_catalog, "getHazardCategories")
+    add_column(setup_catalog, "getHazardous")
+    sample_types = setup_catalog({"portal_type": "SampleType"})
+    logger.info(
+        "Refreshing metadata for %d SampleType(s) ...", len(sample_types))
+    for brain in sample_types:
+        obj = api.get_object(brain)
+        # Metadata-only refresh: don't recompute every index.
+        setup_catalog.catalog_object(
+            obj, api.get_path(obj), idxs=[], update_metadata=1)
+    logger.info("Adding hazard categories [DONE]")
+
+
+@upgradestep(product, version)
+def seed_detached_partition_backrefs(tool):
+    """Seed annotation backrefs for already-detached partitions.
+
+    The `DetachedFrom` field gained a `relationship` attribute so the
+    UIDReferenceField now maintains backrefs on `setDetachedFrom`. Any
+    detached partition created before this change has the forward UID
+    pointer but no backref. Re-set the field to trigger backref
+    maintenance on the link.
+    """
+    query = {
+        "portal_type": "AnalysisRequest",
+        "object_provides": IDetachedPartition.__identifier__,
+    }
+    brains = api.search(query, SAMPLE_CATALOG)
+    total = len(brains)
+    logger.info(
+        "Seeding DetachedFrom backrefs for {} detached partitions".format(
+            total))
+
+    seeded = 0
+    for num, brain in enumerate(brains, start=1):
+        sample = api.get_object(brain)
+        field = sample.getField("DetachedFrom")
+        if field is None:
+            continue
+        target = field.get(sample)
+        if target is None:
+            continue
+        # Re-setting via the field link API ensures the backref
+        # annotation gets created on the target.
+        field.link_reference(target, sample)
+        seeded += 1
+        if num % 100 == 0:
+            logger.info("  ... seeded {}/{}".format(num, total))
+
+    logger.info("Seeded DetachedFrom backrefs for {} samples".format(seeded))
+
+
 @upgradestep(product, version)
 def import_rolemap(tool):
     """Import rolemap step from profiles
@@ -91,6 +268,67 @@ def import_rolemap(tool):
     setup = portal.portal_setup
 
     setup.runImportStepFromProfile(profile, "rolemap")
+
+
+@upgradestep(product, version)
+def setup_reattach_transition(tool):
+    """Register the new 'reattach' workflow transition.
+
+    Re-imports the sample workflow so existing instances pick up
+    the 'reattach' transition (guarded by the existing
+    "Detach Sample Partition" permission) and the matching
+    exit-transitions on the live sample states.
+    """
+    portal = tool.aq_inner.aq_parent
+    setup = portal.portal_setup
+
+    setup.runImportStepFromProfile(profile, "workflow")
+
+
+@upgradestep(product, version)
+def setup_duplicate_sample_transition(tool):
+    """Register the new 'duplicate_sample' workflow transition.
+
+    Re-imports the workflow (new transition guarded by the
+    existing AddAnalysisRequest permission, plus exit-transitions
+    on existing states). Duplicates use the regular
+    AnalysisRequest ID format, so no ID-server template needs to
+    be installed.
+    """
+    portal = tool.aq_inner.aq_parent
+    setup = portal.portal_setup
+
+    setup.runImportStepFromProfile(profile, "workflow")
+
+
+@upgradestep(product, version)
+def remove_dashboard_registry_visibility(tool):
+    """Remove legacy registry-based dashboard panel visibility
+
+    The dashboard previously used a custom registry record
+    'senaite.core.dashboard_panels_visibility' to store per-role
+    visibility settings for each dashboard section. This was a
+    hardcoded permission mapping that duplicated what Plone's
+    standard role system already provides.
+
+    The dashboard now uses a simple role check via DASHBOARD_ROLES
+    instead of the registry. This step removes the stale registry
+    record and re-imports the rolemap.
+    """
+    portal = tool.aq_inner.aq_parent
+    setup = portal.portal_setup
+
+    # Import rolemap
+    setup.runImportStepFromProfile(profile, "rolemap")
+
+    # Remove stale registry record
+    from plone.registry.interfaces import IRegistry
+    from zope.component import getUtility
+    registry = getUtility(IRegistry)
+    key = "senaite.core.dashboard_panels_visibility"
+    if key in registry.records:
+        del registry.records[key]
+        logger.info("Removed registry record '%s'" % key)
 
 
 @upgradestep(product, version)
@@ -134,7 +372,7 @@ def import_registry(tool):
     #   Module Products.CMFCore.exportimport.typeinfo, line 61, in _importNode
     #   Module Products.GenericSetup.utils, line 763, in _initProperties
     # ValueError: undefined property 'add_permission'
-    remove_at_portal_types(tool)
+    remove_at_portal_types(tool, REMOVE_AT_TYPES)
 
     setup.runImportStepFromProfile(profile, "plone.app.registry")
 
@@ -163,6 +401,310 @@ def mark_invalidated_samples(tool):
 
 
 @upgradestep(product, version)
+def migrate_calculations_to_dx(tool):
+    """Converts existing calculations to Dexterity
+    """
+    logger.info("Convert Calculations to Dexterity ...")
+
+    # ensure old AT types are flushed first
+    remove_at_portal_types(tool, REMOVE_AT_TYPES)
+
+    # run required import steps
+    tool.runImportStepFromProfile(profile, "typeinfo")
+    tool.runImportStepFromProfile(profile, "workflow")
+
+    # get the old container
+    origin = api.get_setup().get("bika_calculations")
+    if not origin:
+        # old container is already gone
+        return
+
+    # get the destination container
+    destination = get_setup_folder("calculations")
+
+    # un-catalog the old container
+    uncatalog_object(origin)
+
+    # copy items from old -> new container
+    objects = origin.objectValues()
+    for num, src in enumerate(objects, start=1):
+        migrate_calculation_to_dx(src, destination)
+        if num % 100 == 0:
+            transaction.savepoint()
+
+    # copy snapshots for the container
+    copy_snapshots(origin, destination)
+
+    # remove old AT folder
+    if len(origin) == 0:
+        delete_object(origin)
+    else:
+        logger.warn("Cannot remove {}. Is not empty".format(origin))
+
+    remove_calculations_from_repositorytool()
+    strip_calc_interims_from_services(tool)
+    logger.info("Convert Calculations to Dexterity [DONE]")
+
+
+def _delete_orphaned_reference(rc, ref):
+    """Remove a Reference object whose source no longer exists.
+
+    AT's _deleteReference returns early when getSourceObject() is None,
+    leaving both the ZCatalog index entry and the Reference object itself
+    in the ZODB. This function handles both:
+
+    1. Uncatalogs the brain from rc._catalog so future getBackReferences
+       calls do not find this entry.
+    2. Deletes the Reference object from its annotation parent container
+       to avoid leaving orphaned ZODB data.
+
+    :param rc: The reference_catalog tool
+    :param ref: The orphaned AT Reference object
+    """
+    try:
+        path = "/".join(ref.getPhysicalPath())
+        rc._catalog.uncatalog_object(path)
+    except (AttributeError, KeyError, TypeError):
+        pass
+    try:
+        parent = ref.aq_parent
+        if parent is not None:
+            parent._delObject(ref.id)
+    except (AttributeError, KeyError, TypeError):
+        pass
+
+
+def migrate_calculation_to_dx(src, destination=None):
+    """Migrate an AT profile to DX in the destination folder
+
+    :param src: The source AT object
+    :param destination: The destination folder. If `None`, the parent folder of
+                        the source object is taken
+    """
+    # migrate the contents from the old AT container to the new one
+    portal_type = "Calculation"
+
+    if api.get_portal_type(src) != portal_type:
+        logger.error("Not a '{}' object: {}".format(portal_type, src))
+        return
+
+    # Create the object if it does not exist yet
+    src_id = src.getId()
+    target_id = src_id
+
+    # check if we migrate within the same folder
+    if destination is None:
+        # use a temporary ID for the migrated content
+        target_id = tmpID()
+        # set the destination to the source parent
+        destination = api.get_parent(src)
+
+    target = destination.get(target_id)
+    if not target:
+        # Don' use the api to skip the auto-id generation
+        target = createContent(portal_type, id=target_id)
+        destination._setObject(target_id, target)
+        target = destination._getOb(target_id)
+
+    # Manually set the fields
+    # NOTE: always convert string values to unicode for dexterity fields!
+    target.title = api.safe_unicode(src.Title() or "")
+    target.description = api.safe_unicode(src.Description() or "")
+    target.setPythonImports(src.getPythonImports() or [])
+    target.setFormula(src.getFormula())
+    target.setTestParameters(src.getTestParameters() or [])
+    target.setTestResult(src.getTestResult() or "")
+    target.setDependentServices(src.getDependentServices() or [])
+
+    target_interims = []
+    for src_interim in src.getInterimFields():
+        interim = src_interim.copy()
+        # ensure interim fields are unicode
+        interim["unit"] = src_interim.get("unit") or ""
+        interim["result_type"] = src_interim.get("result_type") or "numeric"
+        interim["choices"] = src_interim.get("choices") or ""
+        # AT uses 'wide'; DX IInterimField uses 'apply_wide'
+        wide = interim.pop("wide", False)
+        interim["apply_wide"] = bool(interim.pop("apply_wide", wide))
+        # AT boolean subfields submitted via :records:ignore_empty are absent
+        # when unchecked; normalise to explicit Python booleans so the DX
+        # form renders them correctly.
+        for key in ("allow_empty", "report", "hidden"):
+            interim[key] = bool(src_interim.get(key, False))
+        target_interims.append(interim)
+    target.setInterimFields(target_interims)
+
+    # Migrate the contents from AT to DX
+    migrator = getMultiAdapter(
+        (src, target), interface=IContentMigrator)
+
+    # copy all (raw) attributes from the source object to the target
+    migrator.copy_attributes(src, target)
+
+    # copy the UID
+    migrator.copy_uid(src, target)
+
+    # create backrefs storage for newly created calculation and
+    # move there uids of AnalisysServiced dependendent on this calc
+    key = "CalculationDependentServices"
+    src_backreferences = get_backreferences(src, relationship=key)
+    target_storage = get_backref_storage(target)
+    target_backrefs = target_storage[key] = PersistentList()
+    for ref in src_backreferences:
+        target_backrefs.append(api.get_uid(ref))
+
+    # NOTE: We need to create the correct snapshot versions based on the stored
+    # versions of the repository tool
+    # migrator.copy_snapshots(src, target)
+    pr = api.get_tool("portal_repository")
+    for record in pr.getHistory(src, oldestFirst=True):
+        # get the calculation object
+        obj = record.object
+        # create a snapshot for this object
+        snapshot = snap_api.take_snapshot(obj, store=False)
+        snapshot["__metadata__"].update({
+            "actor": obj.Creator() or "migrator",
+            "modified": obj.modified().ISO(),
+            "snapshot_created": obj.created().ISO(),
+            "comments": "Migrated snapshot from AT version {0}".format(
+                record.version_id),
+        })
+        # store the snapshot on the target object
+        storage = snap_api.get_storage(target)
+        # append the JSON snapshot to the storage
+        storage.append(json.dumps(snapshot))
+
+    # provide the IAuditable interface to the target object
+    alsoProvides(target, IAuditable)
+
+    # disable the IVersioned interface on the source object
+    if IVersioned.providedBy(src):
+        noLongerProvides(src, IVersioned)
+
+    # copy creators
+    migrator.copy_creators(src, target)
+
+    # copy workflow history
+    migrator.copy_workflow_history(src, target)
+
+    # copy marker interfaces
+    migrator.copy_marker_interfaces(src, target)
+
+    # copy dates
+    migrator.copy_dates(src, target)
+
+    # uncatalog the source object
+    migrator.uncatalog_object(src)
+
+    # delete the old object
+    migrator.delete_object(src)
+
+    # change the ID *after* the original object was removed
+    migrator.copy_id(src, target)
+
+    # Stamp the snapshotted calculation data onto every Analysis that
+    # referenced this Calculation via the old AT reference_catalog entry.
+    # We set each field directly to avoid triggering the new setCalculation
+    # side-effects (interim merging) on already-initialized analyses and to
+    # avoid any dependency on the old Calculation AT field still existing.
+    rc = api.get_tool("reference_catalog")
+    refs = rc.getBackReferences(src, relationship="AnalysisCalculation")
+    calc_uid = api.get_uid(target)
+    calc_formula = target.getMinifiedFormula()
+    calc_imports = json.dumps(target.getPythonImports() or [])
+    calc_version = api.get_version(target) or 0
+    stale_refs = 0
+    for ref in refs:
+        analysis = ref.getSourceObject()
+        if not analysis:
+            # Source Analysis no longer exists (deleted without proper
+            # reference cleanup). AT's _deleteReference bails out when
+            # sobj is None, so uncatalog the brain directly to prevent
+            # this stale entry from appearing in future catalog queries.
+            stale_refs += 1
+            logger.debug(
+                "Stale AnalysisCalculation ref skipped: {}".format(ref))
+            _delete_orphaned_reference(rc, ref)
+            continue
+        analysis.getField("CalculationUID").set(analysis, calc_uid)
+        analysis.getField("CalculationFormula").set(analysis, calc_formula)
+        analysis.getField("CalculationImports").set(analysis, calc_imports)
+        analysis.getField("CalculationVersion").set(analysis, calc_version)
+        analysis.deleteReferences(relationship="AnalysisCalculation")
+    if stale_refs:
+        logger.warn(
+            "Removed {} stale AnalysisCalculation ref(s) for: {}".format(
+                stale_refs, api.get_path(src)))
+
+    logger.info("Migrated Calculation from %s -> %s" % (src, target))
+
+
+def strip_calc_interims_from_services(tool):
+    """Remove from each AnalysisService the interim fields that are already
+    defined by its assigned calculation.
+
+    After the AT->DX Calculation migration the system uses a clean separation:
+    calculation interims and service interims are stored independently.
+    When a sample analysis is created, calc interims come first and
+    service-only interims are appended. Services must therefore not carry
+    duplicates of the calc interims.
+    """
+    logger.info("Strip calculation interims from analysis services ...")
+    brains = api.search(
+        {"portal_type": "AnalysisService"}, SETUP_CATALOG)
+    total = len(brains)
+    for num, brain in enumerate(brains):
+        if num and num % 100 == 0:
+            logger.info(
+                "Processing services {}/{}".format(num, total))
+            transaction.savepoint()
+        service = api.get_object(brain)
+        _strip_calc_interims(service)
+        service._p_deactivate()
+    logger.info(
+        "Strip calculation interims from analysis services [DONE]")
+
+
+def _strip_calc_interims(service):
+    """Remove calc-sourced interims from a single service in-place."""
+    calc = service.getCalculation()
+    if not calc:
+        return
+    calc_keywords = {
+        i.get("keyword") for i in calc.getInterimFields()
+    }
+    service_interims = service.getInterimFields()
+    filtered = [
+        i for i in service_interims
+        if i.get("keyword") not in calc_keywords
+    ]
+    if len(filtered) == len(service_interims):
+        return
+    service.setInterimFields(filtered)
+    logger.info(
+        "Stripped {0} calc interim(s) from service '{1}'".format(
+            len(service_interims) - len(filtered),
+            api.get_title(service)))
+
+
+def remove_calculations_from_repositorytool():
+    """Remove Calculation from Repository Tool
+    """
+    logger.info("Remove auto versioning for Calculations ...")
+    portal_type = "Calculation"
+
+    rt = api.get_tool("portal_repository")
+    mapping = rt._version_policy_mapping
+    mapping.pop(portal_type, None)
+    rt._version_policy_mapping = mapping
+    versionable_types = rt.getVersionableContentTypes()
+    if portal_type in versionable_types:
+        versionable_types.remove(portal_type)
+        rt.setVersionableContentTypes(versionable_types)
+
+    logger.info("Remove auto versioning for Calculation... [DONE]")
+
+
 def upgrade_catalog_modified_index(tool):
     """Update modified index in catalog
     """
@@ -202,30 +744,22 @@ def update_analysis_catalog_indexes(tool):
     logger.info("Update analysis catalog indexes [DONE]")
 
 
-def remove_at_portal_types(tool):
-    """Remove obsolete AT portal type information
+def get_destination_folder(folder_id):
+    """Returns the folder with the given name
     """
-    logger.info("Remove AT types from portal_types tool ...")
-    pt = api.get_tool("portal_types")
-    for type_name in REMOVE_AT_TYPES:
-        fti = pt.getTypeInfo(type_name)
-        # keep DX FTIs
-        if isinstance(fti, DexterityFTI):
-            logger.info("Type '{}' is already a DX FTI".format(fti))
-            continue
-        elif not fti:
-            # Removed already
-            continue
-        pt.manage_delObjects(fti.getId())
+    portal = api.get_portal()
+    folder = portal.get(folder_id)
+    if not folder:
+        logger.info(
+            "Folder '{}' not found and will be create.".format(folder_id))
+        if folder_id not in PORTAL_FOLDER_ITEMS:
+            raise Exception(
+                "Not found data for create folder by: {}".format(folder_id))
 
-    # remove from AT's factory tool as well. This is necessary for the AT's
-    # factory_tool to not shortcut `createObject?type_name=` on object creation
-    ft = api.get_tool("portal_factory")
-    at_types = ft.getFactoryTypes().keys()
-    at_types = filter(lambda name: name not in REMOVE_AT_TYPES, at_types)
-    ft.manage_setPortalFactoryTypes(listOfTypeIds=at_types)
-
-    logger.info("Remove AT types from portal_types tool ... [DONE]")
+        items = [PORTAL_FOLDER_ITEMS[folder_id]]
+        add_dexterity_items(portal, items)
+        folder = portal.get(folder_id)
+    return folder
 
 
 @upgradestep(product, version)
@@ -235,7 +769,7 @@ def migrate_contacts_to_dx(tool):
     logger.info("Migrating Contacts to Dexterity ...")
 
     # Ensure old AT types are flushed first
-    remove_at_portal_types(tool)
+    remove_at_portal_types(tool, REMOVE_AT_TYPES)
 
     # run required import steps
     tool.runImportStepFromProfile(profile, "typeinfo")
@@ -254,6 +788,7 @@ def migrate_contacts_to_dx(tool):
 
         if num % 100 == 0:
             logger.info("Progress: {}/{} contacts migrated".format(num, total))
+            transaction.savepoint()
 
         # Skip if already migrated to Dexterity
         if not api.is_at_content(contact):
@@ -380,7 +915,7 @@ def migrate_multifiles_to_dx(tool):
     logger.info("Migrating Multifiles to Dexterity ...")
 
     # Ensure old AT types are flushed first
-    remove_at_portal_types(tool)
+    remove_at_portal_types(tool, REMOVE_AT_TYPES)
 
     # run required import steps
     tool.runImportStepFromProfile(profile, "typeinfo")
@@ -399,6 +934,7 @@ def migrate_multifiles_to_dx(tool):
 
         if num % 100 == 0:
             logger.info("Progress: {}/{} multifiles migrated".format(num, total))
+            transaction.savepoint()
 
         # Skip if already migrated to Dexterity
         if not api.is_at_content(multifile):
@@ -514,6 +1050,296 @@ def migrate_multifile_to_dx(src, destination=None):
     logger.info("Migrated Multifile from %s -> %s" % (src, target))
 
 
+def migrate_laboratory_to_dx(tool):
+    """Migrates Laboratory to DX
+    """
+    logger.info("Convert Laboratory to Dexterity ...")
+
+    remove_at_portal_types(tool, REMOVE_AT_TYPES)
+
+    # run required import steps
+    tool.runImportStepFromProfile(profile, "typeinfo")
+
+    portal_type = "Laboratory"
+    query = {
+        "portal_type": portal_type,
+    }
+    brains = api.search(query, SETUP_CATALOG)
+
+    if not brains:
+        logger.warning("No Laboratory object found, skipping migration")
+        return
+
+    src = api.get_object(brains[0])
+
+    # Check if already migrated
+    if not api.is_at_content(src):
+        logger.info(
+            "Laboratory already migrated: {}".format(api.get_path(src)))
+        return
+
+    destination = api.get_senaite_setup()
+    migrate_at_laboratory_to_dx(src, destination)
+
+    logger.info("Convert Laboratory to Dexterity [DONE]")
+
+
+def migrate_at_laboratory_to_dx(src, destination):
+    """Create a DX Laboratory in `destination` from the AT `src`, copy all
+    data over, remove the AT source and adopt its id. Returns the new DX
+    Laboratory object.
+    """
+    portal_type = "Laboratory"
+    src_id = api.get_id(src)
+    target_id = tmpID()
+
+    target = destination.get(src_id)
+    if not target:
+        # Don't use the api to skip the auto-id generation
+        target = createContent(portal_type, id=target_id)
+        destination._setObject(target_id, target)
+        target = destination._getOb(target_id)
+
+    # Manually set the fields
+    # NOTE: always convert string values to unicode for dexterity fields!
+    target.title = u(src.getName() or "")
+    target.description = u(src.Description() or "")
+
+    # Laboratory-specific fields
+    target.lab_url = u(src.getLabURL() or "")
+    target.supervisor = src.getRawSupervisor() or ""
+    target.confidence = src.getConfidence() or None
+    target.laboratory_accredited = bool(src.getLaboratoryAccredited())
+    target.accreditation_body = u(src.getAccreditationBody() or "")
+    target.accreditation_body_url = u(src.getAccreditationBodyURL() or "")
+    target.accreditation = u(src.getAccreditation() or "")
+    target.accreditation_reference = u(src.getAccreditationReference() or "")
+    target.accreditation_body_logo = blob_to_named_file(
+        src.getAccreditationBodyLogo(), default_filename=u"logo.png")
+    target.accreditation_page_header = u(src.getAccreditationPageHeader() or "")
+
+    # Organization fields (inherited from Organisation)
+    target.tax_number = u(src.getTaxNumber() or "")
+    target.phone = u(src.getPhone() or "")
+    target.fax = u(src.getFax() or "")
+    target.email = u(src.getEmailAddress() or "")
+    target.account_type = u(src.getAccountType() or "")
+    target.account_name = u(src.getAccountName() or "")
+    target.account_number = u(src.getAccountNumber() or "")
+    target.bank_name = u(src.getBankName() or "")
+    target.bank_branch = u(src.getBankBranch() or "")
+
+    # Copy addresses using the to_dx_address helper
+    postal_address = src.getPostalAddress() or {}
+    if postal_address:
+        target.setPostalAddress(
+            to_dx_address(postal_address, POSTAL_ADDRESS)
+        )
+
+    physical_address = src.getPhysicalAddress() or {}
+    if physical_address:
+        target.setPhysicalAddress(
+            to_dx_address(physical_address, PHYSICAL_ADDRESS)
+        )
+
+    billing_address = src.getBillingAddress() or {}
+    if billing_address:
+        target.setBillingAddress(
+            to_dx_address(billing_address, BILLING_ADDRESS)
+        )
+
+    # Migrate the contents from AT to DX
+    migrator = getMultiAdapter(
+        (src, target), interface=IContentMigrator)
+
+    # copy all (raw) attributes from the source object to the target
+    migrator.copy_attributes(src, target)
+
+    # copy the UID
+    migrator.copy_uid(src, target)
+
+    # copy auditlog
+    migrator.copy_snapshots(src, target)
+
+    # copy creators
+    migrator.copy_creators(src, target)
+
+    # copy workflow history
+    migrator.copy_workflow_history(src, target)
+
+    # copy marker interfaces
+    migrator.copy_marker_interfaces(src, target)
+
+    # copy dates
+    migrator.copy_dates(src, target)
+
+    # uncatalog the source object
+    migrator.uncatalog_object(src)
+
+    # delete the old object
+    migrator.delete_object(src)
+
+    # Ensure Laboratory is allowed in its container before rename
+    permanently_allow_type_for(api.get_portal_type(destination), portal_type)
+
+    # change the ID *after* the original object was removed
+    migrator.copy_id(src, target)
+
+    target.reindexObject()
+
+    logger.info("Migrated Laboratory from %s -> %s" % (src, target))
+    return target
+
+
+def get_laboratory_objects(containers):
+    """Return all Laboratory objects contained in the given containers
+    """
+    laboratories = []
+    for container in containers:
+        if container is None:
+            continue
+        for object_id in list(container.objectIds()):
+            obj = container._getOb(object_id, None)
+            if obj is None:
+                continue
+            if api.get_portal_type(obj) == "Laboratory":
+                laboratories.append(obj)
+    return laboratories
+
+
+def pick_primary_laboratory(setup, bika_setup):
+    """Pick the Laboratory that holds the live data
+
+    The former `SenaiteSetup.laboratory` property returned
+    `bika_setup.laboratory`, so any data entered through the UI lives
+    there. Fall back to the setup folder otherwise.
+    """
+    candidates = []
+    if bika_setup is not None and "laboratory" in bika_setup.objectIds():
+        candidates.append(bika_setup._getOb("laboratory"))
+    if "laboratory" in setup.objectIds():
+        candidates.append(setup._getOb("laboratory"))
+    if "laboratory-1" in setup.objectIds():
+        candidates.append(setup._getOb("laboratory-1"))
+    # any other Laboratory as last resort
+    candidates.extend(get_laboratory_objects([setup, bika_setup]))
+    return candidates[0] if candidates else None
+
+
+def consolidate_laboratory(tool):
+    """Consolidate duplicate Laboratory objects into a single
+    `setup/laboratory`
+
+    The Laboratory was only half-moved into the DX `setup` folder: the
+    bika.lims structure profile still created `bika_setup/laboratory`
+    and `add_dexterity_setup_items` produced an empty `setup/laboratory-1`
+    (the `laboratory` id was blocked by the former
+    `SenaiteSetup.laboratory` property). This keeps the single
+    data-bearing Laboratory, migrates it to DX inside `setup` if needed,
+    removes the duplicates and ensures the canonical id `laboratory`.
+    """
+    logger.info("Consolidate Laboratory ...")
+
+    setup = api.get_senaite_setup()
+    bika_setup = api.get_bika_setup()
+
+    primary = pick_primary_laboratory(setup, bika_setup)
+    if primary is None:
+        logger.warning("No Laboratory object found, nothing to consolidate")
+        return
+
+    primary_uid = api.get_uid(primary)
+
+    # Remove every other Laboratory so the `laboratory` id becomes free
+    for lab in get_laboratory_objects([setup, bika_setup]):
+        if api.get_uid(lab) == primary_uid:
+            continue
+        logger.info("Removing duplicate Laboratory: %s" % api.get_path(lab))
+        api.delete(lab, check_permissions=False)
+
+    # Ensure the type is allowed in the setup folder
+    permanently_allow_type_for(api.get_portal_type(setup), "Laboratory")
+
+    # Ensure the primary is a DX object living in the setup folder
+    if api.is_at_content(primary):
+        primary = migrate_at_laboratory_to_dx(primary, setup)
+    elif api.get_path(api.get_parent(primary)) != api.get_path(setup):
+        primary = api.move_object(primary, setup, check_constraints=False)
+
+    # Ensure the canonical id is `laboratory`
+    if api.get_id(primary) != "laboratory":
+        parent = api.get_parent(primary)
+        parent.manage_renameObject(api.get_id(primary), "laboratory")
+        primary = parent._getOb("laboratory")
+
+    primary.reindexObject()
+    logger.info("Consolidate Laboratory [DONE]: %s" % api.get_path(primary))
+
+
+LABORATORY_IMAGE_FIELDS = (
+    ("accreditation_body_logo", u"logo.png"),
+)
+
+
+@upgradestep(product, version)
+def repair_laboratory_migration(tool):
+    """Repair the Laboratory-to-DX migration
+
+    Two issues need patching on already-migrated instances:
+
+    1. Before #2902, the migration passed AT ImageField values straight
+       through `blob_to_named_file` when they were not BlobWrapper
+       instances. The raw `OFS.Image.Image` objects were assigned to
+       the new `NamedBlobImage` field, which is neither None nor
+       INamed; `plone.formwidget.namedfile` then crashes rendering
+       the laboratory view or edit form.
+
+    2. The new Laboratory FTI was missing the
+       `IMultiCatalogBehavior` behavior, so the catalog multiplex
+       processor refused to index it in any non-portal catalog. The
+       result is that the laboratory is absent from
+       `senaite_catalog_setup` and any code that resolves it through
+       catalog (e.g. `SuperModel` lookups in impress) gets nothing.
+    """
+    logger.info("Repair laboratory migration ...")
+
+    # Re-import typeinfo so the FTI picks up IMultiCatalogBehavior
+    tool.runImportStepFromProfile(profile, "typeinfo")
+
+    setup = api.get_senaite_setup()
+    laboratory = setup.get("laboratory") if setup else None
+    if laboratory is None:
+        logger.info("No laboratory found, skipping repair")
+        return
+
+    # Re-wrap legacy OFS.Image values on the named-file fields
+    for fieldname, default_filename in LABORATORY_IMAGE_FIELDS:
+        repair_laboratory_image_field(
+            laboratory, fieldname, default_filename)
+
+    # Reindex so the multiplex processor now lands the laboratory in
+    # senaite_catalog_setup (and the other catalogs mapped to it)
+    laboratory.reindexObject()
+    logger.info("Reindexed %s" % laboratory)
+
+    logger.info("Repair laboratory migration [DONE]")
+
+
+def repair_laboratory_image_field(laboratory, fieldname, default_filename):
+    """Re-wrap a single image field if it holds a non-INamed legacy value
+    """
+    value = getattr(laboratory, fieldname, None)
+    if value is None:
+        return
+    if INamed.providedBy(value):
+        return
+    named = blob_to_named_file(value, default_filename=default_filename)
+    setattr(laboratory, fieldname, named)
+    logger.info("Repaired %s.%s (%s -> %s)" % (
+        laboratory, fieldname, type(value).__name__,
+        type(named).__name__ if named is not None else None))
+
+
 def to_dx_address(value, address_type=NAIVE_ADDRESS):
     return {
         "type": u(value.get("address_type") or address_type),
@@ -533,7 +1359,7 @@ def create_setup_contacts_folder(tool):
     logger.info("Creating Contacts container in setup folder ...")
 
     # Ensure old AT types are flushed first
-    remove_at_portal_types(tool)
+    remove_at_portal_types(tool, REMOVE_AT_TYPES)
 
     # run required import steps
     tool.runImportStepFromProfile(profile, "typeinfo")
@@ -565,7 +1391,7 @@ def setup_custom_image_and_file_types(tool):
     """
     logger.info("Setup custom File and Image types ...")
     # Ensure old AT types are flushed first
-    remove_at_portal_types(tool)
+    remove_at_portal_types(tool, REMOVE_AT_TYPES)
     portal = tool.aq_inner.aq_parent
     tool.runImportStepFromProfile(profile, "typeinfo")
     tool.runImportStepFromProfile(profile, "workflow")
@@ -588,6 +1414,7 @@ def link_contact_users(tool):
         if num and num % 100 == 0:
             logger.info("Linking contacts to users {0}/{1}"
                         .format(num, total))
+            transaction.savepoint()
 
         contact = api.get_object(brain)
         username = contact.getUsername()
@@ -791,7 +1618,7 @@ def migrate_arreport_to_resultsreport(tool):
     logger.info("Migrating ARReport to Dexterity ResultsReport ...")
 
     # Remove AT portal type and install DX portal type
-    remove_at_portal_types(tool)
+    remove_at_portal_types(tool, REMOVE_AT_TYPES)
     tool.runImportStepFromProfile(profile, "typeinfo")
     tool.runImportStepFromProfile(profile, "workflow")
 
@@ -809,8 +1636,16 @@ def migrate_arreport_to_resultsreport(tool):
         # Get the object
         arreport = api.get_object(brain)
 
-        if num % 100 == 0:
+        if num % 1000 == 0:
             logger.info("Progress: {}/{} reports migrated".format(num, total))
+            # NOTE: We do a full transaction commit to avoid the following
+            # error during this upgrade:
+            #
+            # Traceback (innermost last):
+            #   [...]
+            #   Module ZEO.TransactionBuffer, line 56, in store
+            # IOError: [Errno 28] No space left on device
+            transaction.commit()
 
         # Skip if already migrated to Dexterity
         if not api.is_at_content(arreport):
@@ -973,3 +1808,658 @@ def migrate_arreport_to_dx(src, destination=None):
     target.reindexObject()
 
     logger.info("Migrated ARReport from %s -> %s" % (src, target))
+
+
+@upgradestep(product, version)
+def migrate_worksheets_to_dx(tool):
+    """Convert existing worksheet templates to Dexterity
+    """
+    logger.info("Convert Worksheet's to Dexterity ...")
+
+    # Delete rejected analysis and empty worksheets
+    # before install new content type
+    cleanup_rejected_worksheets()
+
+    # get the current allowed types for portal
+    portal = api.get_portal()
+    pt = api.get_tool("portal_types")
+    type_info = pt.getTypeInfo(portal)
+    allowed_types = type_info.allowed_content_types
+
+    # in case the upgrade step fails with partial migrated contents
+    origin = portal.get("worksheets-old", None)
+
+    # check if WS folder is AT
+    ws_container = portal.get("worksheets", None)
+    if ws_container is not None and api.is_at_content(ws_container):
+        # temporarily append WorksheetFolder as an allowed type
+        portal_type = "WorksheetFolder"
+        if portal_type not in type_info.allowed_content_types:
+            type_info.allowed_content_types = allowed_types + (portal_type,)
+
+        # Rename old AT worksheets folder
+        portal.manage_renameObject("worksheets", "worksheets-old")
+
+        # restore the allowed_types
+        type_info.allowed_content_types = allowed_types
+
+        origin = portal.get("worksheets-old")
+
+    # ensure old AT types are flushed first
+    remove_at_portal_types(tool, REMOVE_AT_TYPES)
+
+    # run required import steps
+    tool.runImportStepFromProfile(profile, "typeinfo")
+    tool.runImportStepFromProfile(profile, "workflow")
+    tool.runImportStepFromProfile(profile, "rolemap")
+    tool.runImportStepFromProfile(profile, "plone.app.registry")
+
+    # get the destination container
+    new_dx_folder = get_destination_folder("worksheets")
+
+    # un-catalog the old container
+    if origin:
+        uncatalog_object(origin)
+
+    # Find all AT Worksheet objects
+    query = {"portal_type": "Worksheet"}
+    brains = api.search(query, WORKSHEET_CATALOG)
+    total = len(brains)
+    logger.info("Found {} Worksheet objects to migrate".format(total))
+
+    catalog = api.get_tool(WORKSHEET_CATALOG)
+    problematic = []
+    for num, brain in enumerate(brains, start=1):
+        if num % 1000 == 0:
+            logger.info(
+                "Progress: {}/{} worksheets migrated".format(num, total))
+            transaction.commit()
+        brain_path = brain.getPath()
+        try:
+            worksheet = api.get_object(brain)
+        except (AttributeError, KeyError) as exc:
+            logger.warn(
+                "Cannot get Worksheet at %s: %s" % (brain_path, exc))
+            catalog.uncatalog_object(brain_path)
+            problematic.append(brain_path)
+            continue
+        migrate_worksheet_to_dx(worksheet, new_dx_folder)
+
+    # remove old AT folder
+    if origin and len(origin) == 0:
+        portal.manage_delObjects(["worksheets-old"])
+
+    if problematic:
+        logger.warn(
+            "Migration finished with {} skipped Worksheet(s):".format(
+                len(problematic)))
+        for path in problematic:
+            logger.warn("  Stale brain removed, AT WS at: %s" % path)
+
+    logger.info("Convert Worksheet's to Dexterity [DONE]")
+
+
+def cleanup_rejected_worksheets():
+    """Delete all rejected worksheets and RejectAnalysis
+    """
+    logger.info("Cleanup rejected worksheets...")
+
+    rejected_analysis_query = {"portal_type": "RejectAnalysis"}
+    for num, brain in enumerate(
+            api.search(rejected_analysis_query, ANALYSIS_CATALOG)):
+        if num and num % 100 == 0:
+            transaction.savepoint()
+        rejected_analysis = api.get_object(brain)
+        api.delete(rejected_analysis, False)
+        logger.info("Delete rejected analysis {}".format(rejected_analysis))
+
+    rejected_worksheets = {
+        "portal_type": "Worksheet",
+        "review_state": "rejected",
+    }
+    for num, brain in enumerate(
+            api.search(rejected_worksheets, WORKSHEET_CATALOG)):
+        if num and num % 100 == 0:
+            transaction.savepoint()
+        ws = api.get_object(brain)
+        if ws.objectValues():
+            continue
+        api.delete(ws, False)
+        logger.info("Delete rejected worksheet {}".format(ws))
+
+    logger.info("Cleanup rejected worksheets [DONE]")
+
+
+def migrate_worksheet_to_dx(src, destination):
+    """Migrate a Worksheet to DX in destination folder
+
+    :param src: The source AT object
+    :param destination: The destination folder
+    """
+    if not api.is_at_content(src):
+        api.move_object(src, destination, check_constraints=False)
+        logger.info("Already migrated: {}".format(api.get_path(src)))
+        return
+
+    target_id = tmpID()
+
+    target = destination.get(target_id)
+    if not target:
+        # Don't use the api to skip the auto-id generation
+        target = createContent("Worksheet", id=target_id)
+        destination._setObject(target_id, target)
+        target = destination._getOb(target_id)
+
+    # Manually set the fields
+    # NOTE: always convert string values to unicode for dexterity fields!
+    target.title = u(src.Title() or "")
+    target.description = u(src.Description() or "")
+    target.worksheet_template = src.getRawWorksheetTemplate()
+    target.method = src.getRawMethod()
+    target.analyst = src.getAnalyst()
+    target.instrument = src.getRawInstrument()
+    target.results_layout = src.getResultsLayout()
+    target.analyses = src.getAnalysesUIDs()
+
+    # move layout
+    layout = []
+    for slot in src.getLayout():
+        layout.append({
+            "position": int(slot["position"]),
+            "type": slot["type"],
+            "container_uid": slot["container_uid"],
+            "analysis_uid": slot["analysis_uid"],
+        })
+    target.layout_view = layout
+
+    # move remarks
+    remarks = []
+    for remark_record in src.getRemarks():
+        remarks.append({
+            "id": remark_record.id,
+            "user_id": remark_record.user_id,
+            "user_name": remark_record.user_name,
+            "created": dtime.to_dt(remark_record.created),
+            "content": remark_record.content,
+        })
+    target.remarks = remarks
+
+    # create backrefs storage for newly created Worksheet and
+    # move there uids of Analyses dependendent on this worksheet
+    key = "WorksheetAnalysis"
+    for an in target.getAnalyses():
+        old_an_backrefs = get_backreferences(an, relationship=key)
+        an_new_storage = get_backref_storage(an)
+        new_an_backrefs = an_new_storage[key] = PersistentList()
+        for ref in old_an_backrefs:
+            new_an_backrefs.append(api.get_uid(ref))
+
+    # move Duplicate, Reject and Attachment to new worksheet
+    for obj in src.objectValues():
+        api.move_object(obj, target, False)
+
+    # Migrate the contents from AT to DX
+    migrator = getMultiAdapter((src, target), interface=IContentMigrator)
+
+    # copy all (raw) attributes from the source object to the target
+    migrator.copy_attributes(src, target)
+
+    # copy the UID
+    migrator.copy_uid(src, target)
+
+    # copy auditlog
+    migrator.copy_snapshots(src, target)
+
+    # copy creators
+    migrator.copy_creators(src, target)
+
+    # copy workflow history
+    migrator.copy_workflow_history(src, target)
+
+    # copy marker interfaces
+    migrator.copy_marker_interfaces(src, target)
+
+    # copy dates
+    migrator.copy_dates(src, target)
+
+    # uncatalog the source object
+    migrator.uncatalog_object(src)
+
+    # delete the old object
+    migrator.delete_object(src)
+
+    # change the ID *after* the original object was removed
+    migrator.copy_id(src, target)
+
+    logger.info("Migrated Worksheet from %s -> %s" % (src, target))
+
+
+@upgradestep(product, version)
+def migrate_analysis_columns_to_setup(tool):
+    """Migrate analysis columns order from registry to setup
+    """
+    logger.info(
+        "Migrating analysis columns order to setup ..."
+    )
+    from senaite.core.registry import get_registry_record
+    from senaite.core.vocabularies.setup import ANALYSIS_COLUMNS
+    from senaite.core.vocabularies.setup import WORKSHEET_ANALYSIS_COLUMNS
+
+    setup = api.get_senaite_setup()
+
+    # Migrate sample view columns
+    registry_sample = get_registry_record(
+        "sampleview_analysis_columns_order", default=[]
+    ) or []
+    if registry_sample:
+        all_keys = list(ANALYSIS_COLUMNS.keys())
+        # append missing columns in their default order
+        missing = [
+            k for k in all_keys if k not in registry_sample
+        ]
+        migrated = tuple(registry_sample) + tuple(missing)
+        setup.setSampleviewAnalysisColumnsOrder(migrated)
+        logger.info(
+            "Migrated sample view columns: %s" % list(migrated)
+        )
+
+    # Migrate worksheet view columns
+    registry_ws = get_registry_record(
+        "worksheetview_analysis_columns_order", default=[]
+    ) or []
+    if registry_ws:
+        all_keys = list(WORKSHEET_ANALYSIS_COLUMNS.keys())
+        # append missing columns in their default order
+        missing = [
+            k for k in all_keys if k not in registry_ws
+        ]
+        migrated = tuple(registry_ws) + tuple(missing)
+        setup.setWorksheetviewAnalysisColumnsOrder(migrated)
+        logger.info(
+            "Migrated worksheet view columns: %s"
+            % list(migrated)
+        )
+
+    logger.info(
+        "Migrating analysis columns order to setup [DONE]"
+    )
+
+
+@upgradestep(product, version)
+def reindex_labcontact_searchable_text(tool):
+    """Reindex contact catalog indexes for LabContact and SupplierContact
+
+    The listing_searchable_text, sortable_title and getParentUID adapters
+    were only registered for the new DX Contact type
+    (senaite.core.interfaces.IContact), causing the indexes to store no
+    data for the legacy AT LabContact and SupplierContact types. Explicit
+    ZCML registrations were added for bika.lims.interfaces.ILabContact and
+    bika.lims.interfaces.ISupplierContact. This step reindexes the affected
+    indexes so existing objects are correctly indexed.
+    """
+    indexes = [
+        "listing_searchable_text",
+        "sortable_title",
+        "getParentUID",
+    ]
+    for index in indexes:
+        logger.info(
+            "Reindexing %s in contact catalog ..." % index
+        )
+        reindex_index(CONTACT_CATALOG, index)
+        logger.info(
+            "Reindexing %s in contact catalog [DONE]" % index
+        )
+
+
+@upgradestep(product, version)
+def rebuild_title_indexes(tool):
+    """Clear and rebuild the title FieldIndex on every SENAITE catalog
+
+    #2901 reindexed the title index across all base catalogs so a new
+    generic indexer could populate them with unicode keys. The reindex
+    rewrites entries per docid but does not clear the BTree first, so
+    pre-existing byte-string keys for non-ASCII titles remain. Any
+    subsequent insert of a unicode key (e.g. when creating or editing
+    a DX object whose title contains non-ASCII characters) then raises
+    `UnicodeDecodeError: 'ascii' codec can't decode byte 0xc3` on
+    BTree key comparison.
+
+    Clearing the index before reindexing wipes all stale byte-string
+    keys and lets the (post-#2901) indexer repopulate the BTree with
+    a single unicode key type. Catalogs are discovered dynamically by
+    walking the portal and filtering on `ISenaiteCatalogObject`, so
+    custom catalogs registered by downstream add-ons are also covered.
+    """
+    logger.info("Rebuild title indexes ...")
+    catalogs = list(iter_senaite_catalogs())
+    total = len(catalogs)
+    for num, catalog in enumerate(catalogs, start=1):
+        logger.info(
+            "Rebuilding title index on %s (%s/%s) ..." % (
+                catalog.id, num, total))
+        rebuild_index(catalog, "title")
+    logger.info("Rebuild title indexes [DONE]")
+
+
+@upgradestep(product, version)
+def cleanup_sample_catalog(tool):
+    """Clean up senaite_catalog_sample indexes and metadata columns
+
+    - Remove obsolete FieldIndexes getProvince and getDistrict from the
+      sample catalog. Client geography belongs on the client catalog and
+      is not meaningful as a sample catalog index; reindexing is also
+      not triggered when client address fields change.
+    - Remove stale metadata columns from the sample catalog: getProvince,
+      getDistrict, getClientURL, getTemplateURL, getPhysicalPath. URLs
+      are fragile (hostname-dependent) and better resolved at render
+      time via memoized UID lookups. getPhysicalPath is unused.
+    """
+    logger.info("Cleaning up sample catalog indexes and columns ...")
+
+    catalog = api.get_tool(SAMPLE_CATALOG)
+
+    # Remove obsolete indexes
+    for idx in ["getDistrict", "getProvince"]:
+        if del_index(catalog, idx):
+            logger.info("Removed index '%s' from sample catalog" % idx)
+
+    # Remove obsolete metadata columns
+    obsolete_columns = [
+        "getClientURL",
+        "getDistrict",
+        "getPhysicalPath",
+        "getProvince",
+        "getTemplateURL",
+    ]
+    for col in obsolete_columns:
+        if del_column(catalog, col):
+            logger.info(
+                "Removed column '%s' from sample catalog" % col
+            )
+
+    logger.info("Cleaning up sample catalog indexes and columns [DONE]")
+
+
+@upgradestep(product, version)
+def add_sample_catalog_indexes(tool):
+    """Add new indexes to senaite_catalog_sample
+
+    - getSampleTypeUID: FieldIndex for filtering samples by type UID.
+    - getSamplePointUID: FieldIndex for filtering samples by sample point UID.
+    - getAnalysesKeywords: KeywordIndex storing the keyword of every analysis
+      contained in the sample and its partitions. Enables queries such as
+      ``catalog(getAnalysesKeywords="glucose")`` to retrieve all samples that
+      include a specific analysis.
+    """
+    logger.info("Adding new indexes to sample catalog ...")
+    catalog = api.get_tool(SAMPLE_CATALOG)
+
+    new_indexes = [
+        ("getSampleTypeUID", "", "FieldIndex"),
+        ("getSamplePointUID", "", "FieldIndex"),
+        ("getAnalysesKeywords", "", "KeywordIndex"),
+    ]
+    for idx_id, idx_attr, idx_type in new_indexes:
+        if add_catalog_index(catalog, idx_id, idx_attr, idx_type):
+            logger.info("Reindexing '%s' in sample catalog ..." % idx_id)
+            reindex_index(SAMPLE_CATALOG, idx_id)
+            logger.info(
+                "Reindexing '%s' in sample catalog [DONE]" % idx_id
+            )
+
+    logger.info("Adding new indexes to sample catalog [DONE]")
+
+
+@upgradestep(product, version)
+def strip_global_client_role(tool):
+    """Remove directly-assigned global 'Client' role from users.
+
+    The 'Client' role is now granted implicitly to users via membership
+    in the per-client group (the group itself carries ``roles=["Client"]``).
+    A user with the role assigned directly through the portal role
+    manager but no client-group membership has the Client landing page
+    but no Owner role on any client folder, which is a half-configured
+    state with no useful access.
+
+    Iterate the principals assigned the 'Client' role via the portal
+    role manager and remove the direct assignment. Users keep the role
+    indirectly through group membership where applicable.
+    """
+    logger.info("Stripping global 'Client' role from users ...")
+    acl = api.get_tool("acl_users")
+    prm = getattr(acl, "portal_role_manager", None)
+    if prm is None:
+        logger.warn(
+            "No portal_role_manager available; nothing to strip")
+        return
+
+    principals = prm.listAssignedPrincipals("Client")
+    total = len(principals)
+    logger.info(
+        "Found %s principals with directly-assigned 'Client' role"
+        % total)
+
+    removed = 0
+    for principal_id, _title in principals:
+        try:
+            prm.removeRoleFromPrincipal("Client", principal_id)
+        except KeyError:
+            logger.warn(
+                "Could not remove 'Client' from '%s'" % principal_id)
+            continue
+        removed += 1
+        logger.info(
+            "Removed direct 'Client' role from '%s'" % principal_id)
+
+    logger.info(
+        "Stripped global 'Client' role from %s/%s principals"
+        % (removed, total))
+
+
+CLIENT_TREE_CATALOGS = (
+    "senaite_catalog_sample",
+    "senaite_catalog_analysis",
+    "senaite_catalog",
+    "senaite_catalog_report",
+    "senaite_catalog_attachments",
+    "senaite_catalog_client",
+    "senaite_catalog_setup",
+    "senaite_catalog_worksheet",
+)
+
+
+@upgradestep(product, version)
+def switch_to_dynamic_client_roles(tool):
+    """Migrate persistent group/local-role access to the dynamic
+    ILocalRoleProvider model.
+
+    Three idempotent passes:
+
+    1. Reindex `allowedRolesAndUsers` on every client-tree object so it
+       picks up the new stable `client:<client_uid>` token.
+    2. Backfill the `linked_client_uid` member property for every
+       already-linked client contact, so the dynamic role provider can
+       authorise those users without having to walk the catalog.
+    3. Remove the orphan `auto_create_client_group` registry record
+       (the field has been dropped from `IClientRegistry`).
+
+    Existing per-client groups and persisted Owner local roles on the
+    client folders are left untouched here; they are removed by the
+    follow-up cleanup upgrade step.
+    """
+    portal = tool.aq_inner.aq_parent
+    reindex_client_tree_allowed_roles()
+    backfill_linked_client_uid()
+    drop_auto_create_client_group_record(portal)
+
+
+def reindex_client_tree_allowed_roles():
+    """Reindex `allowedRolesAndUsers` on every IClient + IClientAware
+    object so they carry the new `client:<uid>` token.
+    """
+    from bika.lims.interfaces import IClient
+    from bika.lims.interfaces import IClientAwareMixin
+
+    logger.info("Reindexing allowedRolesAndUsers on client-tree content ...")
+    seen = set()
+    total = 0
+    for catalog_id in CLIENT_TREE_CATALOGS:
+        catalog = api.get_tool(catalog_id, default=None)
+        if catalog is None:
+            continue
+        brains = catalog.unrestrictedSearchResults({})
+        for brain in brains:
+            uid = getattr(brain, "UID", None)
+            if uid and uid in seen:
+                continue
+            try:
+                obj = brain.getObject()
+            except (AttributeError, KeyError):
+                continue
+            if obj is None:
+                continue
+            if not (IClient.providedBy(obj)
+                    or IClientAwareMixin.providedBy(obj)):
+                continue
+            obj.reindexObject(idxs=["allowedRolesAndUsers"])
+            if uid:
+                seen.add(uid)
+            total += 1
+            if total % 500 == 0:
+                logger.info("  ... reindexed %s objects" % total)
+    logger.info(
+        "Reindexed allowedRolesAndUsers on %s client-tree objects" % total)
+
+
+def backfill_linked_client_uid():
+    """Set the `linked_client_uid` user property for every existing
+    client contact that is already linked to a user account.
+    """
+    from bika.lims.interfaces import IClient
+    from senaite.core.content.contact import CLIENT_UID_KEY
+    from senaite.core.content.contact import _set_user_property
+
+    logger.info("Backfilling `linked_client_uid` on linked users ...")
+    contacts = api.search({"portal_type": "Contact"}, CONTACT_CATALOG)
+    updated = 0
+    for brain in contacts:
+        contact = api.get_object(brain)
+        parent = contact.aq_parent
+        if not IClient.providedBy(parent):
+            continue
+        user = contact.getUser()
+        if user is None:
+            continue
+        _set_user_property(user, CLIENT_UID_KEY, api.get_uid(parent))
+        updated += 1
+    logger.info(
+        "Backfilled `linked_client_uid` on %s users" % updated)
+
+
+def drop_auto_create_client_group_record(portal):
+    """Delete the obsolete `auto_create_client_group` registry record.
+
+    The setting moved out of the registry when client access switched
+    to the dynamic role provider. Leaving the record behind would
+    only confuse future readers.
+    """
+    registry = api.get_tool("portal_registry", default=None)
+    if registry is None:
+        return
+    key = ("senaite.core.registry.schema.IClientRegistry."
+           "auto_create_client_group")
+    if key in registry.records:
+        del registry.records[key]
+        logger.info("Removed orphan registry record '%s'" % key)
+
+
+@upgradestep(product, version)
+def remove_client_manage_access_action(tool):
+    """Drop the `manage_access` action from the Client FTI.
+
+    The action linked to @@sharing on every Client; sharing on the
+    client tree is now disabled because access is granted dynamically
+    by the ILocalRoleProvider. Removing the action prevents admins
+    from clicking through to the (now NotFound) view.
+    """
+    types_tool = api.get_tool("portal_types")
+    fti = types_tool.getTypeInfo("Client")
+    if fti is None:
+        return
+    actions = list(fti.listActions())
+    target_indices = [str(i) for i, a in enumerate(actions)
+                      if a.id == "manage_access"]
+    if not target_indices:
+        return
+    fti.deleteActions(target_indices)
+    logger.info("Removed 'manage_access' action from Client FTI")
+
+
+@upgradestep(product, version)
+def remove_legacy_client_groups(tool):
+    """Remove the per-client group + Owner local-role grant on every
+    Client.
+
+    Pre-2.7 SENAITE auto-created a group per Client (`Client.GROUP_KEY`
+    stored the id on the client object) and granted that group the
+    local Owner role on the client folder. With #2934 client users get
+    Owner + Client dynamically via the ILocalRoleProvider, so the
+    legacy group and its persisted local-role grant are dead weight.
+
+    For each Client:
+
+    1. Find the stored group id and the matching group in
+       portal_groups. Skip the client if no id is stored or the group
+       no longer exists.
+    2. Skip the client if the persisted group id no longer matches the
+       client's own stored ``_client_group_id`` — protects against an
+       admin who renamed the group manually.
+    3. Remove the corresponding entry from ``__ac_local_roles__`` on
+       the client folder via ``manage_delLocalRoles``. This triggers
+       ``reindexObjectSecurity`` recursively so the stale
+       ``user:<group_id>`` token drops out of ``allowedRolesAndUsers``
+       on every descendant. One-time cost; the new ``client:<uid>``
+       token added by #2934 already carries client access from here on.
+    4. Remove the group from portal_groups.
+    5. Clear the ``_client_group_id`` attribute on the client.
+    """
+    portal_groups = api.get_tool("portal_groups")
+    clients = api.search({"portal_type": "Client"}, CLIENT_CATALOG)
+    total = len(clients)
+    removed_groups = 0
+    cleared_local_roles = 0
+    for num, brain in enumerate(clients, start=1):
+        client = api.get_object(brain)
+        if num % 50 == 0:
+            logger.info("Cleaning client groups: %s/%s" % (num, total))
+        group_id = getattr(client, "_client_group_id", None)
+        if not group_id:
+            continue
+        if group_id in (client.__ac_local_roles__ or {}):
+            client.manage_delLocalRoles([group_id])
+            # `manage_delLocalRoles` only mutates `__ac_local_roles__`;
+            # the catalog still carries the stale `user:<group_id>`
+            # token on every descendant until reindexObjectSecurity
+            # walks the subtree. Paying the cost once here is the whole
+            # point of this upgrade step.
+            client.reindexObjectSecurity()
+            cleared_local_roles += 1
+            logger.info(
+                "Cleared Owner local role for group '%s' on client '%s'"
+                % (group_id, client.getName()))
+        group = portal_groups.getGroupById(group_id)
+        if group is not None:
+            portal_groups.removeGroup(group_id)
+            removed_groups += 1
+            logger.info(
+                "Removed legacy client group '%s' for client '%s'"
+                % (group_id, client.getName()))
+        try:
+            delattr(client, "_client_group_id")
+        except AttributeError:
+            pass
+    logger.info(
+        "Legacy client-group cleanup: %s groups removed, "
+        "%s local-role grants cleared on %s clients"
+        % (removed_groups, cleared_local_roles, total))

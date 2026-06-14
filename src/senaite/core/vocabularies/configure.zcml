@@ -19,12 +19,20 @@
       name="senaite.core.vocabularies.analysis_types" />
 
   <utility
+      component=".hazard_categories.HazardCategoriesVocabularyFactory"
+      name="senaite.core.vocabularies.hazard_categories" />
+
+  <utility
       component=".references.ReferenceDefinitionVocabularyFactory"
       name="senaite.core.vocabularies.reference_definition" />
 
   <utility
       component=".analysis_types.DuplicateVocabularyFactory"
       name="senaite.core.vocabularies.duplicate" />
+
+  <utility
+      component=".resulttypes.ResultTypesVocabularyFactory"
+      name="senaite.core.vocabularies.resulttypes" />
 
   <utility
       component=".setup.CurrenciesVocabularyFactory"
@@ -65,5 +73,22 @@
   <utility
       component=".setup.NavigationPortalTypesVocabularyFactory"
       name="senaite.core.vocabularies.navigation_portal_types" />
+
+  <utility
+      component=".instruments.AvailableInstrumentsFactory"
+      name="senaite.core.vocabularies.available_instruments" />
+
+  <utility
+      component=".methods.AvailableMethodsFactory"
+      name="senaite.core.vocabularies.available_methods" />
+
+  <utility
+      component=".setup.AnalysisColumnsVocabularyFactory"
+      name="senaite.core.vocabularies.analysis_columns" />
+
+  <utility
+      component=".setup.WorksheetAnalysisColumnsVocabularyFactory"
+      name="senaite.core.vocabularies.worksheet_analysis_columns"
+      />
 
 </configure>

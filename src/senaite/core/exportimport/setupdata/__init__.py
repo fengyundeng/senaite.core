@@ -34,6 +34,7 @@ from bika.lims.utils import to_unicode
 from bika.lims.utils import to_utf8
 from bika.lims.utils.analysis import create_analysis
 from pkg_resources import resource_filename
+from plone.namedfile.file import NamedBlobImage
 from Products.Archetypes.event import ObjectInitializedEvent
 from Products.CMFCore.utils import getToolByName
 from Products.CMFPlone.utils import _createObjectByType
@@ -357,37 +358,44 @@ class Sub_Groups(WorksheetImporter):
 
 class Lab_Information(WorksheetImporter):
 
+    def get_logo(self, filename):
+        """Read a setup data image and return it as a NamedBlobImage
+        """
+        if not filename:
+            return None
+        path = resource_filename(
+            self.dataset_project,
+            "setupdata/%s/%s" % (self.dataset_name, filename))
+        try:
+            file_data = read_file(path)
+        except IOError as msg:
+            logger.warning("%s. Error on sheet: %s" % (msg, self.sheetname))
+            return None
+        return NamedBlobImage(
+            data=file_data, filename=api.safe_unicode(filename))
+
     def Import(self):
-        laboratory = self.context.bika_setup.laboratory
+        laboratory = self.context.setup.laboratory
         values = {}
         for row in self.get_rows(3):
-            values[row['Field']] = row['Value']
+            values[row["Field"]] = row["Value"]
 
-        if values['AccreditationBodyLogo']:
-            path = resource_filename(
-                self.dataset_project,
-                "setupdata/%s/%s" % (self.dataset_name,
-                                     values['AccreditationBodyLogo']))
-            try:
-                file_data = read_file(path)
-            except Exception as msg:
-                file_data = None
-                logger.warning(msg[0] + " Error on sheet: " + self.sheetname)
-        else:
-            file_data = None
-
-        laboratory.edit(
-            Name=values['Name'],
-            LabURL=values['LabURL'],
-            Confidence=values['Confidence'],
-            LaboratoryAccredited=self.to_bool(values['LaboratoryAccredited']),
-            AccreditationBodyLong=values['AccreditationBodyLong'],
-            AccreditationBody=values['AccreditationBody'],
-            AccreditationBodyURL=values['AccreditationBodyURL'],
-            Accreditation=values['Accreditation'],
-            AccreditationReference=values['AccreditationReference'],
-            AccreditationBodyLogo=file_data,
-            TaxNumber=values['TaxNumber'],
+        api.edit(
+            laboratory,
+            title=api.safe_unicode(values["Name"]),
+            lab_url=api.safe_unicode(values["LabURL"]),
+            confidence=api.to_int(values["Confidence"], default=None),
+            laboratory_accredited=self.to_bool(
+                values["LaboratoryAccredited"]),
+            accreditation_body=api.safe_unicode(values["AccreditationBody"]),
+            accreditation_body_url=api.safe_unicode(
+                values["AccreditationBodyURL"]),
+            accreditation=api.safe_unicode(values["Accreditation"]),
+            accreditation_reference=api.safe_unicode(
+                values["AccreditationReference"]),
+            accreditation_body_logo=self.get_logo(
+                values["AccreditationBodyLogo"]),
+            tax_number=api.safe_unicode(values["TaxNumber"]),
         )
         self.fill_contactfields(values, laboratory)
         self.fill_addressfields(values, laboratory)
@@ -1391,67 +1399,63 @@ class Calculations(WorksheetImporter):
 
     def get_interim_fields(self):
         # preload Calculation Interim Fields sheet
-        sheetname = 'Calculation Interim Fields'
+        sheetname = "Calculation Interim Fields"
         worksheet = self.workbook[sheetname]
         if not worksheet:
             return
         self.interim_fields = {}
         rows = self.get_rows(3, worksheet=worksheet)
         for row in rows:
-            calc_title = row['Calculation_title']
+            calc_title = row["Calculation_title"]
             if calc_title not in self.interim_fields.keys():
                 self.interim_fields[calc_title] = []
             self.interim_fields[calc_title].append({
-                'keyword': row['keyword'],
-                'title': row.get('title', ''),
-                'type': 'int',
-                'hidden': ('hidden' in row and row['hidden']) and True or False,
-                'value': row['value'],
-                'unit': row['unit'] and row['unit'] or ''})
+                "keyword": row["keyword"],
+                "title": row.get("title", ""),
+                "type": "int",
+                "hidden": ("hidden" in row and row["hidden"]) and True or False,
+                "value": row["value"],
+                "unit": row["unit"] and row["unit"] or ""})
 
     def Import(self):
         self.get_interim_fields()
-        folder = self.context.bika_setup.bika_calculations
+        container = self.context.setup.calculations
         for row in self.get_rows(3):
-            if not row['title']:
+            calc_title = row.get("title")
+            if not calc_title:
                 continue
-            calc_title = row['title']
             calc_interims = self.interim_fields.get(calc_title, [])
-            formula = row['Formula']
+            formula = row.get("Formula")
             # scan formula for dep services
             keywords = re.compile(r"\[([^\.^\]]+)\]").findall(formula)
             # remove interims from deps
-            interim_keys = [k['keyword'] for k in calc_interims]
+            interim_keys = [k["keyword"] for k in calc_interims]
             dep_keywords = [k for k in keywords if k not in interim_keys]
 
-            obj = _createObjectByType("Calculation", folder, tmpID())
-            obj.edit(
-                title=calc_title,
-                description=row.get('description', ''),
-                InterimFields=calc_interims,
-                Formula=str(row['Formula'])
-            )
+            obj = api.create(container, "Calculation",
+                             title=calc_title,
+                             description=row.get("description"),
+                             InterimFields=calc_interims,
+                             Formula=formula)
+
             for kw in dep_keywords:
                 self.defer(src_obj=obj,
-                           src_field='DependentServices',
+                           src_field="dependent_services",
                            dest_catalog=SETUP_CATALOG,
-                           dest_query={'portal_type': 'AnalysisService',
-                                       'getKeyword': kw}
+                           dest_query={"portal_type": "AnalysisService",
+                                       "getKeyword": kw}
                            )
-            obj.unmarkCreationFlag()
-            renameAfterCreation(obj)
-            notify(ObjectInitializedEvent(obj))
 
         # Now we have the calculations registered, try to assign default calcs
         # to methods
         sheet = self.workbook["Methods"]
         bsc = getToolByName(self.context, SETUP_CATALOG)
         for row in self.get_rows(3, sheet):
-            if row.get('title', '') and row.get('Calculation_title', ''):
-                meth = self.get_object(bsc, "Method", row.get('title'))
+            if row.get("title", "") and row.get("Calculation_title", ""):
+                meth = self.get_object(bsc, "Method", row.get("title"))
                 if meth and not meth.getCalculation():
                     calctit = safe_unicode(
-                        row['Calculation_title']).encode('utf-8')
+                        row["Calculation_title"]).encode("utf-8")
                     calc = self.get_object(bsc, "Calculation", calctit)
                     if calc:
                         meth.setCalculation(calc.UID())

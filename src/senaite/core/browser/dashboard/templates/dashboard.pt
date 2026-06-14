@@ -3,18 +3,18 @@
       i18n:domain="senaite.core">
 
   <metal:content-title fill-slot="content-title">
-    <a href=""
-       style="float:right;"
-       i18n:translate=""
-       tal:attributes="href string:${portal_url}?redirect_to=frontpage">
-      Switch to frontpage
-    </a>
-    <h1 class="documentFirstHeading" i18n:translate="">System Dashboard</h1>
+    <h1 class="documentFirstHeading">
+      <span i18n:translate="">Welcome</span>,
+      <span tal:content="python:view.get_user_fullname()">User</span>
+    </h1>
   </metal:content-title>
 
-  <a style="float:right;" href="#" i18n:translate="">Switch to Frontpage</a>
-
   <metal:content-description fill-slot="content-description">
+    <div class="documentDescription text-muted">
+      <span tal:content="python:view.get_current_date()">Monday, 22 April 2026</span>
+      &mdash;
+      <span tal:content="python:view.get_current_time()">14:30</span>
+    </div>
   </metal:content-description>
 
   <metal:content-core fill-slot="content-core">
@@ -250,12 +250,12 @@
            e.preventDefault();
            var barchartid = $(this).attr("target-id");
            if ($("#" + barchartid).is(":visible")) {
-             senaite.core.controllers.SiteView.set_cookie("visible." + barchartid, 0);
+             senaite.core.controllers.SiteView.setCookie("visible." + barchartid, 0);
              $("#" + barchartid + "-period").hide();
              $("#" + barchartid).hide();
              $("#" + barchartid).closest("div.dashboard-panels").find(".dashboard-info-panel-wrapper").show();
            } else {
-             senaite.core.controllers.SiteView.set_cookie("visible." + barchartid, 1);
+             senaite.core.controllers.SiteView.setCookie("visible." + barchartid, 1);
              $("#" + barchartid + "-period").show();
              $("#" + barchartid).show();
              $("#" + barchartid).closest("div.dashboard-panels").find(".dashboard-info-panel-wrapper").hide();
@@ -473,69 +473,11 @@
             </select>
           </div>
         </div>
-        <div class='dashboard-panels'>
-
-          <!-- Bar-chart panels -->
-          <tal:barchart_panels repeat="panel python:[p for p in section.get('panels',[]) if p.get('type','')=='bar-chart-panel']">
-            <div tal:attributes="class python:'dashboard-bargraph-panel-wrapper %s' % panel.get('class', '');"
-                 tal:define='itemnum repeat/panel/number;'>
-              <div class="toggle-barchart" tal:condition="python:panel.get('data','[]')!='[]'">
-                <a tal:attributes='target-id python:"bar-chart-%s-%s" % (section["id"],itemnum);'
-                   href="#" i18n:translate="">Show/hide timeline summary</a>
-              </div>
-              <div class='bar-chart-period' tal:attributes='id python:"bar-chart-%s-%s-period" % (section["id"],itemnum)' style="display:none;">
-                <h3 tal:content="python:panel.get('name', '')"></h3>
-                <div class='h2-legend'>
-                  <span i18n:translate="">From</span>&nbsp;
-                  <span tal:content="python:plone_view.toLocalizedTime(view.date_from)"></span>
-                  &nbsp;<span i18n:translate="">to</span>&nbsp;
-                  <span tal:content="python:plone_view.toLocalizedTime(view.date_to)"></span>
-                  (<span i18n:translate="">updated every 2 hours</span>)
-                </div>
-                <ul class='dashboard-time-selector'>
-                  <li tal:attributes="class python:'selected' if view.periodicity == 'd' else ''"><a tal:attributes='href string:${view/portal_url}/senaite-dashboard?p=d' i18n:translate="">Daily</a></li>
-                  <li tal:attributes="class python:'selected' if view.periodicity == 'w' else ''"><a tal:attributes='href string:${view/portal_url}/senaite-dashboard?p=w' i18n:translate="">Weekly</a></li>
-                  <li tal:attributes="class python:'selected' if view.periodicity == 'm' else ''"><a tal:attributes='href string:${view/portal_url}/senaite-dashboard?p=m' i18n:translate="">Monthly</a></li>
-                  <li tal:attributes="class python:'selected' if view.periodicity == 'q' else ''"><a tal:attributes='href string:${view/portal_url}/senaite-dashboard?p=q' i18n:translate="">Quarterly</a></li>
-                  <li tal:attributes="class python:'selected' if view.periodicity == 'b' else ''"><a tal:attributes='href string:${view/portal_url}/senaite-dashboard?p=b' i18n:translate="">Biannual</a></li>
-                  <li tal:attributes="class python:'selected' if view.periodicity == 'y' else ''"><a tal:attributes='href string:${view/portal_url}/senaite-dashboard?p=y' i18n:translate="">Yearly</a></li>
-                </ul>
-              </div>
-              <div class='bar-chart'
-                   tal:attributes='id python:"bar-chart-%s-%s" % (section["id"],itemnum);
-                          data panel/data;
-                          data-colors panel/datacolors;'
-                   style='display:none'>
-                <div class="bar-chart-no-data" i18n:translate="">There is no available data for the selected period</div>
-              </div>
-            </div>
-          </tal:barchart_panels>
-
-          <!-- Simple panels -->
-          <tal:simple_panels repeat="panel python:[p for p in section.get('panels',[]) if p.get('type','')=='simple-panel']">
-            <div style="min-width: 12em;"
-                 tal:define="num panel/number;
-                        numclass python:'' if num==0 else 'highlight';"
-                 tal:attributes="class python:'card my-2 dashboard-info-panel-wrapper %s %s' % (panel.get('class', ''), numclass);">
-              <a tal:attributes="href panel/link">
-                <div class='dashboard-info-panel'>
-                  <div class="dashboard-info-panel-vertbar">
-                    <div class="vertbar-remaining"
-                         tal:attributes="style python:'height: {}%'.format(100 - panel.get('percentage', 0))"></div>
-                    <div class="vertbar-done"
-                         tal:attributes="style python:'height: {}%'.format(panel.get('percentage', 0))"></div>
-                  </div>
-                  <div tal:content="panel/number" class='dashboard-info-panel-number'></div>
-                  <div tal:content="panel/legend" class='dashboard-info-panel-total' tal:condition="python:panel.get('legend','')"></div>
-                  <div tal:content="panel/description" class='dashboard-info-panel-description'></div>
-                </div>
-              </a>
-            </div>
-          </tal:simple_panels>
-          <div class='clearfix'></div>
-        </div>
       </div>
-    </tal:section>
+    </tal:statistics>
+
+    <script tal:attributes="src string:${portal_url}/++resource++senaite.core.dashboard.js"></script>
+
     <input tal:replace="structure context/@@authenticator/authenticator"/>
   </metal:content-core>
 </html>
